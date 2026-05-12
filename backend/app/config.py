@@ -18,10 +18,14 @@ class Settings(BaseSettings):
     database_name: str = "collegeconnect"
     google_application_credentials: str = ""
     google_impersonate_user: str = ""
+    firebase_service_account_path: str = "firebase-adminsdk.json"
+    firebase_service_account_json: str = ""
     # Session booking emails (Resend): https://resend.com/docs
     resend_api_key: str = ""
     # e.g. "CollegeConnect <bookings@yourdomain.com>" (must be a verified sender in Resend)
     resend_from: str = ""
+
+    cors_allowed_origins: str = "http://localhost:5173,http://127.0.0.1:5173,https://collegeconnects.co.in"
 
     # AWS S3 — college ID card uploads (presigned PUT from browser)
     aws_access_key_id: str = ""
@@ -30,7 +34,18 @@ class Settings(BaseSettings):
     s3_bucket: str = ""
     # Object key prefix, no leading/trailing slashes
     s3_college_ids_prefix: str = "college-ids"
+    s3_temp_college_ids_prefix: str = "college-ids-temp"
     s3_profile_pictures_prefix: str = "profile-pictures"
+    signup_temp_upload_ttl_minutes: int = 30
+    # Razorpay: https://dashboard.razorpay.com/
+    razorpay_key_id: str = ""
+    razorpay_key_secret: str = ""
+    # Your live website URL (e.g., https://collegeconnects.co.in)
+    base_url: str = "https://collegeconnects.co.in"
+    jwt_secret_key: str = ""
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_exp_minutes: int = 60 * 24 * 7
+    jwt_issuer: str = "collegeconnect-api"
 
 
 settings = Settings()

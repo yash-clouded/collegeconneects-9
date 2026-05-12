@@ -18,33 +18,33 @@ class AdvisorCreate(BaseModel):
 
     name: str = Field(min_length=1)
 
-    gender: str
+    gender: Optional[str] = ""
 
     college_email: EmailStr = Field(alias="collegeEmail")
 
-    detected_college: str = Field(alias="detectedCollege")
+    detected_college: Optional[str] = Field(default="", alias="detectedCollege")
 
-    branch: str
+    branch: Optional[str] = ""
 
-    phone: str = Field(min_length=1)
+    phone: Optional[str] = Field(default=None, min_length=1)
 
-    upi_id: str = Field(alias="upiId")
+
 
     personal_email: Optional[EmailStr] = Field(default=None, alias="personalEmail")
 
-    state: str
+    state: Optional[str] = ""
 
-    jee_mains_percentile: str = Field(alias="jeeMainsPercentile")
+    jee_mains_percentile: Optional[str] = Field(default="", alias="jeeMainsPercentile")
 
-    jee_mains_rank: str = Field(alias="jeeMainsRank")
+    jee_mains_rank: Optional[str] = Field(default="", alias="jeeMainsRank")
 
     jee_advanced_rank: Optional[str] = Field(default=None, alias="jeeAdvancedRank")
 
-    bio: str
+    bio: Optional[str] = None
 
-    skills: Optional[str] = None
 
-    achievements: Optional[str] = None
+
+
 
     languages: list[str] = Field(default_factory=list)
 
@@ -54,15 +54,19 @@ class AdvisorCreate(BaseModel):
 
     preferred_timezones: list[str] = Field(default_factory=list, alias="preferredTimezones")
 
-    session_price: str = Field(alias="sessionPrice")
+    session_price: Optional[str] = Field(default="0", alias="sessionPrice")
 
     # Acknowledgment checkbox; college ID + optional profile photo live in S3 — we store object keys only.
 
-    college_id_acknowledged: bool = Field(default=True, alias="collegeIdAcknowledged")
+    college_id_acknowledged: bool = Field(default=False, alias="collegeIdAcknowledged")
 
     college_id_front_key: Optional[str] = Field(default=None, alias="collegeIdFrontKey")
 
     college_id_back_key: Optional[str] = Field(default=None, alias="collegeIdBackKey")
+
+    id_upload_token: Optional[str] = Field(default=None, alias="idUploadToken")
+
+    role: str = "advisor"
 
     referral_code: Optional[str] = Field(default=None, alias="referralCode")
 
@@ -115,11 +119,10 @@ class AdvisorCreate(BaseModel):
     @field_validator(
         "jee_advanced_rank",
         "language_other",
-        "achievements",
-        "skills",
         "profile_picture",
         "college_id_front_key",
         "college_id_back_key",
+        "id_upload_token",
         mode="before",
     )
 
@@ -149,11 +152,6 @@ class AdvisorCreate(BaseModel):
             raise ValueError("preferredTimezones must be a list of time ranges")
 
         cleaned = [str(item).strip() for item in v if str(item).strip()]
-
-        if len(cleaned) < 4:
-
-            raise ValueError("Add at least 4 preferred time slots")
-
         return cleaned
 
 
@@ -173,4 +171,5 @@ class AdvisorResponse(BaseModel):
     name: str
 
     created_at: datetime
+    role: str = "advisor"
 

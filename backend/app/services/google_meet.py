@@ -8,22 +8,37 @@ class GoogleMeetService:
     def __init__(self):
         self.scopes = ['https://www.googleapis.com/auth/calendar']
         self.creds = None
-        if settings.google_application_credentials:
-            self.creds = service_account.Credentials.from_service_account_file(
-                settings.google_application_credentials, scopes=self.scopes
-            )
-            if hasattr(settings, 'google_impersonate_user') and settings.google_impersonate_user:
-                self.creds = self.creds.with_subject(settings.google_impersonate_user)
-        self.service = build('calendar', 'v3', credentials=self.creds) if self.creds else None
+        self.service = None
 
-    def create_meeting(self, summary: str, start_time: datetime.datetime, end_time: datetime.datetime, attendees: list[str]):
+    def init_from_settings(self):
+        if settings.google_application_credentials:
+            try:
+                self.creds = service_account.Credentials.from_service_account_file(
+                    settings.google_application_credentials, scopes=self.scopes
+                )
+                if hasattr(settings, 'google_impersonate_user') and settings.google_impersonate_user:
+                    self.creds = self.creds.with_subject(settings.google_impersonate_user)
+                self.service = build('calendar', 'v3', credentials=self.creds)
+            except FileNotFoundError:
+                # Credentials file missing on local dev; service remains disabled
+                self.creds = None
+                self.service = None
+            except Exception:
+                # Any other error while initializing Google APIs should not crash import
+                self.creds = None
+                self.service = None
+
+    def create_actual_meeting_link(self, summary: str, start_time: datetime.datetime, end_time: datetime.datetime):
+        """
+        Creates a Google Meet link on the master calendar WITHOUT attendees.
+        This keeps the link 'hidden' from the default calendar invitations.
+        """
         if not self.service:
-            print("Google Calendar service not initialized. Check credentials.")
             return None
 
         event = {
             'summary': summary,
-            'description': 'CollegeConnect Session',
+            'description': 'Private meeting space for CollegeConnect Session',
             'start': {
                 'dateTime': start_time.isoformat(),
                 'timeZone': 'UTC',
@@ -32,7 +47,6 @@ class GoogleMeetService:
                 'dateTime': end_time.isoformat(),
                 'timeZone': 'UTC',
             },
-            'attendees': [{'email': email} for email in attendees],
             'conferenceData': {
                 'createRequest': {
                     'requestId': str(uuid.uuid4()),
@@ -52,4 +66,52 @@ class GoogleMeetService:
             'meet_link': created_event.get('hangoutLink')
         }
 
-google_meet_service = GoogleMeetService()
+    def create_placeholder_event(self, summary: str, start_time: datetime.datetime, end_time: datetime.datetime, attendees: list[str]):
+        """
+        Creates a calendar invitation for attendees WITHOUT a Meet link.
+        Forces them to join via the CollegeConnect Dashboard.
+        """
+        if not self.service:
+            return None
+
+        # Format attendees for Google API
+        attendee_list = [{'email': email} for email in attendees if email]
+
+        event = {
+            'summary': summary,
+            'description': 'Please join the session through your CollegeConnect Dashboard 10 minutes before the scheduled time.\n\nDashboard: https://collegeconnect.co/dashboard',
+            'start': {
+                'dateTime': start_time.isoformat(),
+                'timeZone': 'UTC',
+            },
+            'end': {
+                'dateTime': end_time.isoformat(),
+                'timeZone': 'UTC',
+            },
+            'attendees': attendee_list,
+            # IMPORTANT: We OMIT conferenceData here to keep the meet link hidden
+        }
+
+        return self.service.events().insert(
+            calendarId='primary',
+            body=event,
+            sendUpdates='all' # Sends email invite
+        ).execute()
+
+    def create_meeting(self, summary: str, start_time: datetime.datetime, end_time: datetime.datetime, attendees: list[str]):
+        # Legacy method kept for fallback
+        return self.create_actual_meeting_link(summary, start_time, end_time)
+
+# Lazy instance: don't attempt to read service account file at import time
+google_meet_service = None
+
+def get_google_meet_service() -> GoogleMeetService | None:
+    global google_meet_service
+    if google_meet_service is None:
+        try:
+            svc = GoogleMeetService()
+            svc.init_from_settings()
+            google_meet_service = svc
+        except Exception:
+            google_meet_service = None
+    return google_meet_service

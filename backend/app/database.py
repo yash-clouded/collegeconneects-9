@@ -1,3 +1,4 @@
+from __future__ import annotations
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
 from app.config import settings
@@ -29,6 +30,23 @@ async def connect_db() -> None:
     await db.password_reset_otps.create_index("email")
     await db.password_reset_otps.create_index("role")
     await db.password_reset_otps.create_index("expires_at", expireAfterSeconds=0)
+    # Sign-up OTPs (Resend) — same TTL pattern as password reset
+    await db.signup_otps.create_index("email")
+    await db.signup_otps.create_index("role")
+    await db.signup_otps.create_index("expires_at", expireAfterSeconds=0)
+    # Temporary unauthenticated signup ID uploads (short-lived + one-time token)
+    await db.signup_temp_uploads.create_index("token_hash", unique=True)
+    await db.signup_temp_uploads.create_index("role")
+    await db.signup_temp_uploads.create_index("expires_at", expireAfterSeconds=0)
+    
+    # Bookings indexes for performance
+    await db.bookings.create_index("status")
+    await db.bookings.create_index("razorpay_order_id")
+    await db.bookings.create_index("created_at")
+    
+    # Predictor leads
+    await db.predictor_leads.create_index("email")
+    await db.predictor_leads.create_index("created_at")
 
 
 async def close_db() -> None:
