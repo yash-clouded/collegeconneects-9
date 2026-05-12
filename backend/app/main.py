@@ -1,19 +1,20 @@
+from __future__ import annotations
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.deps import firebase_claims
 from app.config import settings
 from app.database import close_db, connect_db, get_database
-from app.firebase_service import init_firebase_admin
-from app.routers import advisors, students, auth, bookings
+from app.routers import advisors, students, auth, bookings, upload, payments, predictor
+from app.s3_service import s3_configured
 from app.scheduler import start_scheduler, stop_scheduler
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_db()
-    init_firebase_admin()
     start_scheduler()
     yield
     stop_scheduler()
@@ -22,28 +23,41 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="CollegeConnect API", lifespan=lifespan)
 
+# CORS configuration: handle "allow_credentials" correctly with wildcard origin
+origins = [o.strip() for o in settings.cors_allowed_origins.split(",") if o.strip()]
+
+# If origins is just ["*"], we must set allow_credentials=False for FastAPI.
+# If we need credentials (cookies/auth), we should list specific domains.
+allow_credentials = True
+if "*" in origins:
+    allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 app.include_router(students.router, prefix="/api")
 app.include_router(advisors.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")
 app.include_router(bookings.router, prefix="/api")
+app.include_router(upload.router, prefix="/api")
+app.include_router(payments.router, prefix="/api")
+app.include_router(predictor.router, prefix="/api")
 
 
-@app.get("/health")
+@app.api_route("/api/health", methods=["GET", "HEAD"])
 async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/api/meta/s3")
-async def meta_s3() -> dict[str, str | bool]:
-    """Non-secret check that college-ID upload env is loaded (browser uploads still need bucket CORS)."""
+async def meta_s3(claims: dict = Depends(firebase_claims)) -> dict[str, str | bool]:
+    """Check S3 config status. Restricted to authenticated users."""
     return {
         "configured": s3_configured(),
         "bucket": settings.s3_bucket if s3_configured() else "",
@@ -53,17 +67,17 @@ async def meta_s3() -> dict[str, str | bool]:
 
 
 @app.get("/api/meta/db-stats")
-async def db_stats() -> dict[str, str | int]:
-    """Use this to confirm which database name the API uses and document counts (Compass must use the same cluster + database)."""
+async def db_stats(claims: dict = Depends(firebase_claims)) -> dict[str, str | int]:
+    """Database stats and collection names. Restricted to authenticated users."""
     db = get_database()
     return {
         "database_name": settings.database_name,
-        "students_count": await db.students.count_documents({}),
-        "advisors_count": await db.advisors.count_documents({}),
+        "students_count": await db.students.estimated_document_count(),
+        "advisors_count": await db.advisors.estimated_document_count(),
     }
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root() -> dict[str, str]:
     return {
         "message": "CollegeConnect API",

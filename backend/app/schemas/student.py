@@ -9,22 +9,23 @@ class StudentCreate(BaseModel):
 
     name: str = Field(min_length=1)
     email: EmailStr
-    phone: str = Field(min_length=1)
-    gender: str
-    state: str
-    upi_id: str = Field(alias="upiId")
-    academic_status: str = Field(alias="academicStatus")
-    jee_mains_percentile: str = Field(alias="jeeMainsPercentile")
-    jee_mains_rank: str = Field(alias="jeeMainsRank")
+    phone: Optional[str] = Field(default=None, min_length=1)
+    gender: Optional[str] = ""
+    state: Optional[str] = ""
+    academic_status: Optional[str] = Field(default="", alias="academicStatus")
+    jee_mains_percentile: Optional[str] = Field(default="", alias="jeeMainsPercentile")
+    jee_mains_rank: Optional[str] = Field(default="", alias="jeeMainsRank")
     jee_advanced_rank: Optional[str] = Field(default=None, alias="jeeAdvancedRank")
     languages: list[str] = Field(default_factory=list)
     language_other: Optional[str] = Field(default=None, alias="languageOther")
     # Optional avatar: S3 object key from presigned upload (not a data URL when S3 is configured).
     profile_picture: Optional[str] = Field(default=None, alias="profilePicture")
 
-    college_id_front_key: Optional[str] = Field(default=None, alias="collegeIdFrontKey")
 
-    college_id_back_key: Optional[str] = Field(default=None, alias="collegeIdBackKey")
+
+
+
+
 
     referral_code: Optional[str] = Field(default=None, alias="referralCode")
 
@@ -47,8 +48,6 @@ class StudentCreate(BaseModel):
         "jee_advanced_rank",
         "language_other",
         "profile_picture",
-        "college_id_front_key",
-        "college_id_back_key",
         mode="before",
     )
     @classmethod
@@ -59,9 +58,20 @@ class StudentCreate(BaseModel):
 
 
 class StudentResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     id: str
     email: EmailStr
     name: str
     created_at: datetime
+    total_spent: float = 0.0
+    total_sessions: int = 0
+    # Profile fields — returned for profile page display
+    phone: Optional[str] = None
+    state: Optional[str] = None
+    academic_status: Optional[str] = None
+    jee_mains_percentile: Optional[str] = None
+    jee_mains_rank: Optional[str] = None
+    jee_advanced_rank: Optional[str] = None
+    languages: list[str] = Field(default_factory=list)
+    language_other: Optional[str] = None

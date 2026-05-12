@@ -1,9 +1,10 @@
 from datetime import datetime, timezone, timedelta
+import secrets
 from typing import Literal
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from pymongo.errors import DuplicateKeyError, OperationFailure, PyMongoError
 
 from app.database import get_database
@@ -16,10 +17,12 @@ from app.mailer import (
 )
 from app.s3_service import (
     college_id_keys_valid_for_uid,
+    move_temp_college_id_to_user,
     profile_picture_key_valid_for_uid,
     s3_configured,
 )
 from app.schemas.advisor import AdvisorCreate, AdvisorResponse
+from app.temp_uploads import get_temp_upload_record, mark_temp_upload_claimed
 
 router = APIRouter(prefix="/advisors", tags=["advisors"])
 
@@ -78,6 +81,8 @@ class AdvisorProfileUpdate(BaseModel):
     phone: str | None = None
     personal_email: str | None = None
     state: str | None = None
+    date_of_birth: str | None = None
+    gender: str | None = None
     jee_mains_percentile: str | None = None
     jee_mains_rank: str | None = None
     jee_advanced_rank: str | None = None
@@ -88,14 +93,47 @@ class AdvisorProfileUpdate(BaseModel):
     language_other: str | None = None
     preferred_timezones: list[str] | None = None
     session_price: str | None = None
+    college_id_front_key: str | None = None
+    college_id_back_key: str | None = None
+    profile_picture: str | None = None
+    current_study_year: int | None = None
+    study_year_at_signup: int | None = None
+    study_year_anchor_date: str | None = None
+    roll_number: str | None = None
+    upi_id: str | None = None
+    detected_college: str | None = None
+    academic_status: str | None = None
+
+    @field_validator("current_study_year", "study_year_at_signup", mode="before")
+    @classmethod
+    def validate_study_year(cls, v: object) -> int | None:
+        if v is None or v == "":
+            return None
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return None
+
+    @field_validator("languages", "preferred_timezones", mode="before")
+    @classmethod
+    def validate_lists(cls, v: object) -> list[str] | None:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(",") if x.strip()]
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return None
 
 
 class AdvisorBookingCreate(BaseModel):
     advisor_id: str
     selected_slot: str
+    selected_date: str
 
 
 class AdvisorSessionUpdateNotify(BaseModel):
+    booking_id: str
     action: Literal["accept", "reject", "change"]
     student_email: str
     student_name: str
@@ -112,21 +150,50 @@ async def list_advisors() -> list[dict]:
     docs = (
         await get_database()
         .advisors.find(
-            {},
+            {
+                "is_self_healed": {"$ne": True},
+                "name": {"$ne": "New User"},
+                # Use $and to combine $or conditions properly
+                "$and": [
+                    {
+                        "$or": [
+                            {"detected_college": {"$ne": "", "$exists": True}},
+                            {"detectedCollege": {"$ne": "", "$exists": True}},
+                        ]
+                    },
+                    {
+                        "$or": [
+                            {"branch": {"$exists": True, "$ne": "", "$nin": ["Awaiting Profile Setup"]}},
+                        ]
+                    },
+                ],
+            },
             {
                 "name": 1,
-                "detected_college": 1,
                 "branch": 1,
-                "session_price": 1,
-                "skills": 1,
                 "bio": 1,
+                "session_price": 1,
+                "sessionPrice": 1,
+                "detected_college": 1,
+                "detectedCollege": 1,
                 "languages": 1,
                 "preferred_timezones": 1,
                 "preferredTimezones": 1,
+                "current_study_year": 1,
+                "study_year_at_signup": 1,
+                "study_year_anchor_date": 1,
+                "created_at": 1,
+                # Verification fields needed for 50% gate
+                "jee_mains_rank": 1,
+                "jeeMainsRank": 1,
+                "college_id_front_key": 1,
+                "skills": 1,
+                "achievements": 1,
+                "profile_picture": 1,
             },
         )
         .sort("updated_at", -1)
-        .to_list(length=200)
+        .to_list(length=1000)
     )
     out: list[dict] = []
     for d in docs:
@@ -137,20 +204,35 @@ async def list_advisors() -> list[dict]:
         slots = d.get("preferred_timezones") or d.get("preferredTimezones")
         if not isinstance(slots, list):
             slots = []
+        college = d.get("detected_college") or d.get("detectedCollege") or ""
+        # Skip advisors with no college info at all
+        if not college:
+            continue
         out.append(
             {
                 "id": str(d.get("_id")),
                 "name": d.get("name") or "",
-                "college": d.get("detected_college") or "",
+                "college": college,
+                "detected_college": college,
                 "branch": d.get("branch") or "",
                 "session_price": str(d.get("session_price", "") or ""),
-                "skills": d.get("skills") or "",
                 "bio": d.get("bio") or "",
                 "languages": langs,
                 "preferred_timezones": [str(x) for x in slots if x is not None],
+                "current_study_year": d.get("current_study_year"),
+                "study_year_at_signup": d.get("study_year_at_signup"),
+                "study_year_anchor_date": str(d["study_year_anchor_date"]) if d.get("study_year_anchor_date") else None,
+                "created_at": str(d["created_at"]) if d.get("created_at") else None,
+                # Verification fields for frontend 50% gate
+                "jee_mains_rank": d.get("jee_mains_rank") or "",
+                "college_id_front_key": d.get("college_id_front_key") or "",
+                "skills": d.get("skills") or "",
+                "achievements": d.get("achievements") or "",
+                "profile_picture": d.get("profile_picture") or "",
             }
         )
     return out
+
 
 
 @router.post("/book")
@@ -182,8 +264,12 @@ async def book_advisor(
     if not advisor_email:
         raise HTTPException(status_code=400, detail="Advisor email is missing.")
     selected_slot = str(payload.selected_slot or "").strip()
+    selected_date = str(payload.selected_date or "").strip() # e.g. "2024-05-10"
     if not selected_slot:
         raise HTTPException(status_code=400, detail="Select one preferred time slot.")
+    if not selected_date:
+        raise HTTPException(status_code=400, detail="Select a date for the session.")
+        
     preferred_slots = advisor.get("preferred_timezones") or advisor.get("preferredTimezones") or []
     if not isinstance(preferred_slots, list):
         preferred_slots = []
@@ -194,13 +280,47 @@ async def book_advisor(
             detail="Selected slot must be one of advisor preferred time slots.",
         )
 
+    # Calculate scheduled_time and end_time
+    # selected_slot is usually something like "10:00 AM - 11:00 AM" or "10:00 AM"
+    # We'll try to parse the start time from the slot.
+    try:
+        import re
+        # Try to find something like "10:00 AM" or "10 PM"
+        time_match = re.search(r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))", selected_slot)
+        if time_match:
+            time_str = time_match.group(1)
+            # Combine date and time
+            dt_str = f"{selected_date} {time_str}"
+            # Try parsing with various formats
+            formats = ["%Y-%m-%d %I:%M %p", "%Y-%m-%d %I %p", "%Y-%m-%d %I:%M%p", "%Y-%m-%d %I%p"]
+            parsed_dt = None
+            for f in formats:
+                try:
+                    parsed_dt = datetime.strptime(dt_str, f)
+                    break
+                except ValueError:
+                    continue
+            
+            if parsed_dt:
+                # Assume local time for now, or UTC if preferred. 
+                # Ideally we'd handle timezones but for simplicity:
+                scheduled_time = parsed_dt.replace(tzinfo=timezone.utc)
+            else:
+                scheduled_time = now + timedelta(days=1)
+        else:
+            scheduled_time = now + timedelta(days=1)
+    except Exception:
+        scheduled_time = now + timedelta(days=1)
+    
+    end_time = scheduled_time + timedelta(hours=1)
+
     try:
         send_booking_email_to_advisor(
             advisor_email=advisor_email,
             advisor_name=str(advisor.get("name") or "Advisor"),
             student_name=str(student.get("name") or "Student"),
             student_email=student_email,
-            selected_slot=selected_slot,
+            selected_slot=f"{selected_date} at {selected_slot}",
         )
     except Exception as e:
         raise HTTPException(
@@ -209,11 +329,6 @@ async def book_advisor(
         ) from e
 
     # Persist the booking in the database
-    now = datetime.now(timezone.utc)
-    # Assume 1 hour session for now, adjust if there's a specific duration
-    # We need to parse selected_slot or just store it. 
-    # For now, we'll store the text slot and a placeholder scheduled_time if we can't parse it easily.
-    # In a real app, selected_slot should be a timestamp.
     booking_doc = {
         "advisor_id": str(advisor["_id"]),
         "student_id": str(student["_id"]),
@@ -221,24 +336,27 @@ async def book_advisor(
         "student_name": str(student.get("name") or "Student"),
         "student_email": student_email,
         "selected_slot": selected_slot,
+        "selected_date": selected_date,
         "session_price": str(advisor.get("session_price", "")),
         "status": "pending",
-        "scheduled_time": now + timedelta(days=1), # Placeholder: use actual slot parsing if possible
-        "end_time": now + timedelta(days=1, hours=1),
+        "scheduled_time": scheduled_time,
+        "end_time": end_time,
         "student_joined": False,
         "advisor_joined": False,
         "created_at": now,
         "updated_at": now
     }
-    await db.bookings.insert_one(booking_doc)
+    result = await db.bookings.insert_one(booking_doc)
 
     return {
         "ok": True,
+        "booking_id": str(result.inserted_id),
         "advisor_email": advisor_email,
         "selected_slot": selected_slot,
         "email_sent": True,
         "email_error": "",
     }
+
 
 
 @router.post("/sessions/notify-student")
@@ -271,8 +389,36 @@ async def notify_student_about_session_update(
     else:
         new_slot = None
 
+    booking_id = payload.booking_id
+    if not ObjectId.is_valid(booking_id):
+        raise HTTPException(status_code=400, detail="Invalid booking id.")
+
     if payload.action == "accept":
         student_email = str(payload.student_email).strip().lower()
+        booking = await db.bookings.find_one({"_id": ObjectId(booking_id)})
+        if not booking:
+            raise HTTPException(status_code=404, detail="Booking not found.")
+
+        update_fields: dict = {"status": "confirmed", "updated_at": datetime.now(timezone.utc)}
+
+        # Generate Meet Link if possible
+        try:
+            meet_data = google_meet_service.create_actual_meeting_link(
+                summary=f"CollegeConnect: {advisor_name} <> {booking.get('student_name', 'Student')}",
+                start_time=booking["scheduled_time"],
+                end_time=booking["end_time"]
+            )
+            if meet_data:
+                update_fields["meet_link"] = meet_data["meet_link"]
+                update_fields["google_event_id"] = meet_data["event_id"]
+        except Exception as e:
+            # Don't fail the whole request if Google Calendar fails, but log it or inform
+            print(f"Google Meet creation failed: {e}")
+
+        await db.bookings.update_one(
+            {"_id": ObjectId(booking_id)},
+            {"$set": update_fields}
+        )
         await db.advisors.update_one(
             {"_id": advisor["_id"]},
             {"$inc": {"total_sessions": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}},
@@ -283,6 +429,25 @@ async def notify_student_about_session_update(
         )
         await apply_referral_rewards_on_session_accept(db, advisor, student_email)
         return {"ok": True}
+
+    if payload.action == "reject":
+        await db.bookings.update_one(
+            {"_id": ObjectId(booking_id)},
+            {"$set": {"status": "cancelled", "updated_at": datetime.now(timezone.utc)}}
+        )
+    elif payload.action == "change":
+        new_slot = str(payload.new_slot or "").strip()
+        if not new_slot:
+            raise HTTPException(status_code=400, detail="New slot is required for change.")
+        if new_slot not in normalized_slots:
+            raise HTTPException(
+                status_code=400,
+                detail="New slot must be one of your preferred time slots.",
+            )
+        await db.bookings.update_one(
+            {"_id": ObjectId(booking_id)},
+            {"$set": {"status": "changed", "selected_slot": new_slot, "updated_at": datetime.now(timezone.utc)}}
+        )
 
     try:
         send_advisor_session_update_email_to_student(
@@ -319,23 +484,78 @@ async def create_advisor(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="College email does not match your Firebase sign-in session.",
         )
+ 
+    db = get_database()
+    # Check if they are already a student
+    if await db.students.find_one({"$or": [{"firebase_uid": uid}, {"email": claim_email}]}):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account is registered as a Student. Please use the Student Portal.",
+        )
+    front_key = payload.college_id_front_key
+    back_key = payload.college_id_back_key
 
     if s3_configured():
-        if not payload.college_id_front_key or not payload.college_id_back_key:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="College ID front and back uploads are required (S3 object keys missing).",
-            )
-        if not college_id_keys_valid_for_uid(
+        has_direct_keys = bool(front_key and back_key)
+        if has_direct_keys and not college_id_keys_valid_for_uid(
             uid,
             "advisor",
-            payload.college_id_front_key,
-            payload.college_id_back_key,
+            front_key,
+            back_key,
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="College ID upload keys do not match this account or session.",
             )
+
+        if (not has_direct_keys) and payload.id_upload_token:
+            temp = await get_temp_upload_record(
+                db,
+                role="advisor",
+                raw_token=str(payload.id_upload_token),
+            )
+            if not temp:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Temporary ID upload token is invalid or expired. Re-upload your ID card.",
+                )
+            try:
+                front_key = move_temp_college_id_to_user(
+                    uid,
+                    "advisor",
+                    "front",
+                    str(temp.get("front_key") or ""),
+                )
+                back_key = move_temp_college_id_to_user(
+                    uid,
+                    "advisor",
+                    "back",
+                    str(temp.get("back_key") or ""),
+                )
+            except (ValueError, RuntimeError) as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Could not finalize temporary ID uploads: {e!s}",
+                ) from e
+            claimed = await mark_temp_upload_claimed(
+                db,
+                role="advisor",
+                raw_token=str(payload.id_upload_token),
+                claimed_by_uid=uid,
+            )
+            if not claimed:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Temporary ID upload token was already used. Please re-upload your ID card.",
+                )
+
+        # We allow minimal signup without ID keys. They will be required before the advisor can be 'verified'.
+        # if not front_key or not back_key:
+        #     raise HTTPException(
+        #         status_code=status.HTTP_400_BAD_REQUEST,
+        #         detail="College ID front and back uploads are required (S3 object keys missing).",
+        #     )
+
         if payload.profile_picture:
             pp = str(payload.profile_picture).strip()
             if pp.startswith("data:"):
@@ -349,9 +569,11 @@ async def create_advisor(
                     detail="Profile picture key does not match this account or session.",
                 )
 
-    db = get_database()
     now = datetime.now(timezone.utc)
     doc = payload.model_dump(by_alias=False)
+    doc["college_id_front_key"] = str(front_key)
+    doc["college_id_back_key"] = str(back_key)
+    doc.pop("id_upload_token", None)
     doc.pop("referral_code", None)
     referrer_info = await resolve_signup_referral_or_raise(
         db,
@@ -417,6 +639,7 @@ async def create_advisor(
         college_email=payload.college_email,
         name=payload.name,
         created_at=now,
+        role="advisor",
     )
 
 
@@ -425,19 +648,71 @@ async def get_my_advisor(claims: dict = Depends(firebase_claims)) -> dict:
     uid = claims["uid"]
     db = get_database()
     doc = await db.advisors.find_one({"firebase_uid": uid})
+    if doc and "role" not in doc:
+        await db.advisors.update_one({"_id": doc["_id"]}, {"$set": {"role": "advisor"}})
+        doc["role"] = "advisor"
+
+    if doc:
+        # Check if they ALSO exist in the students collection (Dual-account detection)
+        student_check = await db.students.find_one({"firebase_uid": uid})
+        if student_check:
+             # If they exist in both, we prioritize the one with the 'advisor' role for .ac.in emails
+             # But for safety, we raise 403 to force a choice or admin intervention
+             raise HTTPException(
+                 status_code=403, 
+                 detail="Security Alert: Dual-role detected. Please contact support to merge your Student and Advisor accounts."
+             )
+        
+        # Strict role check
+        if doc.get("role") != "advisor":
+             raise HTTPException(status_code=403, detail="Unauthorized access to Advisor portal.")
+    
     if not doc:
-        claim_email = (claims.get("email") or "").lower()
-        if claim_email:
-            doc = await db.advisors.find_one({"college_email": claim_email})
-            if doc:
-                # Backfill UID for older rows created before firebase_uid mapping.
-                await db.advisors.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {"firebase_uid": uid}},
-                )
-                doc["firebase_uid"] = uid
-    if not doc:
-        raise HTTPException(status_code=404, detail="Advisor profile not found")
+        # Check if they are already a student
+        student_doc = await db.students.find_one({"firebase_uid": uid})
+        if student_doc:
+            raise HTTPException(
+                status_code=403, 
+                detail="This account is registered as a Student. Please use the Student Portal."
+            )
+
+        # SELF-HEALING: Create skeleton if missing
+        email = (claims.get("email") or "").lower()
+        if not email:
+            raise HTTPException(status_code=404, detail="Advisor profile not found")
+        
+        # Check if they look like an advisor by email
+        import re
+        is_advisor_email = bool(re.match(r".*@.*(\.ac\.in|\.edu\.in|\.edu)$", email, re.IGNORECASE))
+        if not is_advisor_email:
+             # If they don't have an advisor email, we might want to block them or at least warn.
+             # For now, we allow it if they specifically chose 'Advisor' in signup, 
+             # but they will be blocked if they have a Student profile (checked above).
+             pass
+
+        now = datetime.now(timezone.utc)
+        new_doc = {
+            "firebase_uid": uid,
+            "college_email": email,
+            "name": claims.get("name") or email.split("@")[0],
+            "phone": "",
+            "state": "",
+            "branch": "Awaiting Profile Setup",
+            "bio": "Recovered profile. Please update your details.",
+            "session_price": "199",
+            "current_study_year": 1,
+            "preferred_timezones": [],
+            "total_earnings": 0,
+            "total_sessions": 0,
+            "total_students": 0,
+            "role": "advisor",
+            "created_at": now,
+            "updated_at": now,
+            "is_self_healed": True
+        }
+        res = await db.advisors.insert_one(new_doc)
+        new_doc["_id"] = res.inserted_id
+        doc = new_doc
     
     doc = _normalize_advisor_doc(doc)
     doc["id"] = str(doc.pop("_id"))
@@ -490,6 +765,8 @@ async def update_my_advisor(
         return doc
 
     updates["updated_at"] = datetime.now(timezone.utc)
+    if doc.get("is_self_healed"):
+        updates["is_self_healed"] = False
     await db.advisors.update_one({"_id": doc["_id"]}, {"$set": updates})
     fresh = await db.advisors.find_one({"_id": doc["_id"]})
     if not fresh:
@@ -498,6 +775,26 @@ async def update_my_advisor(
     fresh["id"] = str(fresh.pop("_id"))
     fresh.pop("password_hash", None)
     return await _add_advisor_stats(fresh, db)
+
+
+@router.delete("/me")
+async def delete_my_advisor(claims: dict = Depends(firebase_claims)) -> dict:
+    uid = claims["uid"]
+    db = get_database()
+    advisor = await db.advisors.find_one({"firebase_uid": uid})
+    if not advisor:
+        raise HTTPException(status_code=404, detail="Advisor profile not found")
+        
+    email = advisor.get("college_email", "").lower().strip()
+    
+    # 1. Delete advisor profile
+    await db.advisors.delete_one({"_id": advisor["_id"]})
+    
+    # 2. Delete from auth_accounts
+    if email:
+        await db.auth_accounts.delete_many({"email": email, "role": "advisor"})
+        
+    return {"ok": True, "message": "Account deleted permanently"}
 
 
 @router.get("/id/{advisor_id}")

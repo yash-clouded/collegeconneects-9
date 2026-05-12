@@ -13,9 +13,11 @@ from app.mailer import send_student_final_slot_email_to_advisor
 from app.referral_signup import insert_referral_from_signup, resolve_signup_referral_or_raise
 from app.s3_service import (
     college_id_keys_valid_for_uid,
+    move_temp_college_id_to_user,
     profile_picture_key_valid_for_uid,
     s3_configured,
 )
+from app.temp_uploads import get_temp_upload_record, mark_temp_upload_claimed
 from app.schemas.student import StudentCreate, StudentResponse
 
 router = APIRouter(prefix="/students", tags=["students"])
@@ -29,8 +31,8 @@ class StudentProfileUpdate(BaseModel):
     jee_mains_percentile: str | None = None
     jee_mains_rank: str | None = None
     jee_advanced_rank: str | None = None
-    language_other: str | None = None
     languages: list[str] | None = None
+    language_other: str | None = None
 
 
 class StudentFinalSlotNotify(BaseModel):
@@ -62,36 +64,13 @@ async def create_student(
             detail="Email does not match your Firebase sign-in session.",
         )
 
-    if s3_configured():
-        if not payload.college_id_front_key or not payload.college_id_back_key:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="College ID front and back uploads are required (S3 object keys missing).",
-            )
-        if not college_id_keys_valid_for_uid(
-            uid,
-            "student",
-            payload.college_id_front_key,
-            payload.college_id_back_key,
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="College ID upload keys do not match this account or session.",
-            )
-        if payload.profile_picture:
-            pp = str(payload.profile_picture).strip()
-            if pp.startswith("data:"):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Profile picture must be uploaded to S3 (use presigned upload), not embedded as base64.",
-                )
-            if not profile_picture_key_valid_for_uid(uid, "student", pp):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Profile picture key does not match this account or session.",
-                )
-
     db = get_database()
+    # Check if they are already an advisor
+    if await db.advisors.find_one({"$or": [{"firebase_uid": uid}, {"college_email": claim_email}]}):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account is registered as an Advisor. Please use the Advisor Portal.",
+        )
     now = datetime.now(timezone.utc)
     doc = payload.model_dump(by_alias=False)
     doc.pop("referral_code", None)
@@ -154,30 +133,95 @@ async def create_student(
         email=payload.email,
         name=payload.name,
         created_at=now,
+        role="student",
     )
 
 
-@router.get("/me")
-async def get_my_student(claims: dict = Depends(firebase_claims)) -> dict:
+@router.get("/me", response_model=StudentResponse)
+async def get_my_student(claims: dict = Depends(firebase_claims)) -> StudentResponse:
     uid = claims["uid"]
     db = get_database()
     doc = await db.students.find_one({"firebase_uid": uid})
+    if doc and "role" not in doc:
+        await db.students.update_one({"_id": doc["_id"]}, {"$set": {"role": "student"}})
+        doc["role"] = "student"
+
+    if doc:
+        # Check if they ALSO exist in the advisors collection (Dual-account detection)
+        advisor_check = await db.advisors.find_one({"firebase_uid": uid})
+        if advisor_check:
+             raise HTTPException(
+                 status_code=403,
+                 detail="Security Alert: Dual-role detected. Please contact support to merge your Student and Advisor accounts."
+             )
+
+        # Strict role check
+        if doc.get("role") != "student":
+             raise HTTPException(status_code=403, detail="Unauthorized access to Student portal.")
+
     if not doc:
-        claim_email = (claims.get("email") or "").lower()
-        if claim_email:
-            doc = await db.students.find_one({"email": claim_email})
-            if doc:
-                # Backfill UID for older rows created before firebase_uid mapping.
-                await db.students.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {"firebase_uid": uid}},
-                )
-                doc["firebase_uid"] = uid
-    if not doc:
-        raise HTTPException(status_code=404, detail="Student profile not found")
+        # Check if they are already an advisor
+        advisor_doc = await db.advisors.find_one({"firebase_uid": uid})
+        if advisor_doc:
+            raise HTTPException(
+                status_code=403,
+                detail="This account is registered as an Advisor. Please use the Advisor Portal."
+            )
+
+        # SELF-HEALING: Create skeleton if missing
+        email = (claims.get("email") or "").lower()
+        if not email:
+            raise HTTPException(status_code=404, detail="Student profile not found")
+
+        # Prevent advisors from accidentally creating student skeletons
+        import re
+        if bool(re.match(r".*@.*(\.ac\.in|\.edu\.in|\.edu)$", email, re.IGNORECASE)):
+             raise HTTPException(
+                 status_code=403,
+                 detail="Your college email indicates you are an Advisor. Please use the Advisor Portal."
+             )
+
+        now = datetime.now(timezone.utc)
+        new_doc = {
+            "firebase_uid": uid,
+            "email": email,
+            "name": claims.get("name") or email.split("@")[0],
+            "phone": "",
+            "state": "",
+            "academic_status": "Awaiting Profile Setup",
+            "jee_mains_percentile": "",
+            "jee_mains_rank": "",
+            "jee_advanced_rank": "",
+            "created_at": now,
+            "updated_at": now,
+            "total_sessions": 0,
+            "role": "student",
+            "is_self_healed": True
+        }
+        res = await db.students.insert_one(new_doc)
+        new_doc["_id"] = res.inserted_id
+        doc = new_doc
+ 
+    # Calculate stats dynamically
+    confirmed_bookings = await db.bookings.find({
+        "student_email": doc["email"],
+        "status": {"$in": ["confirmed", "finalized"]}
+    }).to_list(length=1000)
+
+    total_sessions = len(confirmed_bookings)
+    total_spent = 0.0
+    for b in confirmed_bookings:
+        try:
+            total_spent += float(b.get("session_price") or 0)
+        except (ValueError, TypeError):
+            continue
+
+    # Update doc with calculated stats
     doc["id"] = str(doc.pop("_id"))
-    doc.pop("password_hash", None)
-    return doc
+    doc["total_sessions"] = total_sessions
+    doc["total_spent"] = total_spent
+    
+    return StudentResponse(**doc)
 
 
 @router.patch("/me")
@@ -202,12 +246,21 @@ async def update_my_student(
         raise HTTPException(status_code=404, detail="Student profile not found")
 
     updates = payload.model_dump(exclude_unset=True)
+    if "jee_mains_percentile" in updates:
+        updates["jeeMainsPercentile"] = updates["jee_mains_percentile"]
+    if "jee_mains_rank" in updates:
+        updates["jeeMainsRank"] = updates["jee_mains_rank"]
+    if "jee_advanced_rank" in updates:
+        updates["jeeAdvancedRank"] = updates["jee_advanced_rank"]
+        
     if not updates:
         doc["id"] = str(doc.pop("_id"))
         doc.pop("password_hash", None)
         return doc
 
     updates["updated_at"] = datetime.now(timezone.utc)
+    if doc.get("is_self_healed"):
+        updates["is_self_healed"] = False
     await db.students.update_one({"_id": doc["_id"]}, {"$set": updates})
     fresh = await db.students.find_one({"_id": doc["_id"]})
     if not fresh:
@@ -215,6 +268,26 @@ async def update_my_student(
     fresh["id"] = str(fresh.pop("_id"))
     fresh.pop("password_hash", None)
     return fresh
+
+
+@router.delete("/me")
+async def delete_my_student(claims: dict = Depends(firebase_claims)) -> dict:
+    uid = claims["uid"]
+    db = get_database()
+    student = await db.students.find_one({"firebase_uid": uid})
+    if not student:
+        raise HTTPException(status_code=404, detail="Student profile not found")
+        
+    email = student.get("email", "").lower().strip()
+    
+    # 1. Delete student profile
+    await db.students.delete_one({"_id": student["_id"]})
+    
+    # 2. Delete from auth_accounts to completely free the email
+    if email:
+        await db.auth_accounts.delete_many({"email": email, "role": "student"})
+        
+    return {"ok": True, "message": "Account deleted permanently"}
 
 
 @router.get("/id/{student_id}")
